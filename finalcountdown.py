@@ -2,11 +2,14 @@ import numpy as np
 import cv2 as cv
 import glob
 
+"""
+Calculates the world position of a point in the camera coordinate system
+TODO: we run this 4 times, we can just do a single matrix multiplication instead
+"""
+
 def solve_world_position(camera_world, image_points, intrinsics, distortion, rmat):
     undistorted_image_points = cv.undistortPoints(image_points, intrinsics, distortion)
     x, y = undistorted_image_points[0][0]
-    #homogenous_image_points = np.hstack((image_points, np.ones((image_points.shape[0], 1))))
-    #x, y = image_points
     Rinv = rmat.T
     ray_im = np.array([x, y, 1])
     ray_world = Rinv @ ray_im
@@ -49,53 +52,43 @@ def calibrate_camera():
 
     return cv.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
 
-ret, K, dist, rvecs, tvecs = calibrate_camera()
+def calculate_camera_world_position(cap, detector, K, dist, marker_length):
+    # Accumulate image points and object points for the origin marker
+    image_points = []
+    object_points = []
+
+    for i in range(10):
+        ret, frame = cap.read()
+        corners, ids, rejected = detector.detectMarkers(frame)
+        origin_marker = int(np.where(ids == 0)[0][0])
+        origin_image_points = corners[origin_marker][0]
+        image_points.extend(origin_image_points)
+        object_points.extend([
+            [0, 0, 0],
+            [0, 0, -marker_length],
+            [-marker_length, 0, -marker_length],
+            [-marker_length, 0, 0],
+        ])
+
+    origin_image_points = np.array(image_points, dtype=np.float32)
+    origin_world_points = np.array(object_points, dtype=np.float32)
+    success, rvecs, tvecs = cv.solvePnP(origin_world_points, origin_image_points, K, dist, flags=cv.SOLVEPNP_ITERATIVE)
+
+    np_rodrigues = np.asarray(rvecs[:,:],np.float64)
+    rmat = cv.Rodrigues(np_rodrigues)[0]
+    camera_world_position = -np.matrix(rmat).T @ np.matrix(tvecs)
+    camera_world_position = np.asarray(camera_world_position).reshape(-1)
+    return camera_world_position, rmat, rvecs, tvecs
+
+ret, K, dist, _, _ = calibrate_camera()
 cap = cv.VideoCapture('output.avi')
-ret, frame = cap.read()
 
-# Get video properties for the output
-fps = cap.get(cv.CAP_PROP_FPS)
-width = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
-
-# Create VideoWriter object
-fourcc = cv.VideoWriter_fourcc(*'mp4v')
-out = cv.VideoWriter('output_with_cube2.mp4', fourcc, fps, (width, height))
-
-camera_world_position = None
-rmat = None
-marker_length = 20 # marker length is 20mm
-origin_marker = 0
-tracking_marker = 1
+# marker length is 20mm
+marker_length = 20 
 aruco_dict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_6X6_50)
 aruco_params = cv.aruco.DetectorParameters()
 detector = cv.aruco.ArucoDetector(aruco_dict, aruco_params)
-corners, ids, rejected = detector.detectMarkers(frame)
-
-# Accumulate image points and object points for the origin marker
-image_points = []
-object_points = []
-
-for i in range(10):
-    ret, frame = cap.read()
-    corners, ids, rejected = detector.detectMarkers(frame)
-    origin_image_points = corners[origin_marker][0]
-    image_points.extend(origin_image_points)
-    object_points.extend([
-        [0, 0, 0],
-        [0, 0, -marker_length],
-        [-marker_length, 0, -marker_length],
-        [-marker_length, 0, 0],
-    ])
-
-origin_image_points = np.array(image_points, dtype=np.float32)
-origin_world_points = np.array(object_points, dtype=np.float32)
-success, rvecs, tvecs = cv.solvePnP(origin_world_points, origin_image_points, K, dist, flags=cv.SOLVEPNP_ITERATIVE)
-
-np_rodrigues = np.asarray(rvecs[:,:],np.float64)
-rmat = cv.Rodrigues(np_rodrigues)[0]
-camera_world_position = -np.matrix(rmat).T @ np.matrix(tvecs)
-camera_world_position = np.asarray(camera_world_position).reshape(-1)
+camera_world_position, rmat, rvecs, tvecs = calculate_camera_world_position(cap, detector, K, dist, 20)
 
 while True:
     ret, frame = cap.read()
@@ -104,28 +97,18 @@ while True:
         break
 
     corners, ids, rejected = detector.detectMarkers(frame)
-
-
     cv.aruco.drawDetectedMarkers(frame, corners, ids)
 
-    """
-    Im using the marker with id 0 as the origin of the coordinate system.
-    we use this to calculate the camera translation and rotation.
-    """
 
-    origin_marker = int(np.where(ids == 0)[0][0])
-
-    all_cube_world_points = []
-
-    if len(corners) != 2 or len(corners[tracking_marker][0]) != 4:
+#    If we dont have 4 corners for the tracking marker, skip drawing the cube
+    if len(corners) != 2 or len(corners[1][0]) != 4:
         cv.imshow("img", frame)
-        # Write the frame even if no cube is detected
-        #out.write(frame)
         cv.waitKey(1)
         continue
 
     tracking_marker = int(np.where(ids == 1)[0][0])
 
+    all_cube_world_points = []
     for i in range(4):
         cube_image_points = corners[tracking_marker][0][i]
         cube_world_points = solve_world_position(camera_world_position, cube_image_points, K, dist, rmat)
@@ -173,11 +156,9 @@ while True:
     cv.putText(frame, coord_text, text_pos, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
     cv.imshow("img", frame)
     # Write the processed frame to the output video
-    #out.write(frame)
     cv.waitKey(1)
 
 # Release everything
 cap.release()
-out.release()
 cv.destroyAllWindows()
 
